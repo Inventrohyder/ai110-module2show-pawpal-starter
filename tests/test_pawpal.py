@@ -1,0 +1,375 @@
+"""Core behavior suite for the PawPal+ logic layer (real objects, no mocks)."""
+
+from datetime import date
+
+from pawpal_system import Owner, Pet, Scheduler, Task
+
+
+def make_task(description: str = "Morning walk", time: str = "08:00", **kwargs) -> Task:
+    return Task(
+        description=description,
+        time=time,
+        date=kwargs.pop("date", date.today()),
+        **kwargs
+    )
+
+
+def test_mark_complete_changes_task_status():
+    task = make_task()
+    task.mark_complete()
+    assert task.completed is True
+
+
+def test_new_task_starts_incomplete():
+    assert make_task().completed is False
+
+
+def test_adding_task_increases_pet_task_count():
+    pet = Pet(name="Mochi", species="dog")
+    pet.add_task(make_task())
+    assert len(pet.list_tasks()) == 1
+
+
+def test_pending_tasks_excludes_completed_ones():
+    pet = Pet(name="Mochi", species="dog")
+    done = make_task("Feeding", "09:00")
+    done.mark_complete()
+    pet.add_task(done)
+    pet.add_task(make_task("Evening walk", "18:00"))
+    assert [t.description for t in pet.pending_tasks()] == ["Evening walk"]
+
+
+def test_owner_add_and_get_pet():
+    owner = Owner(name="Jordan")
+    mochi = Pet(name="Mochi", species="dog")
+    owner.add_pet(mochi)
+    assert owner.get_pet("Mochi") is mochi
+
+
+def test_get_pet_returns_none_for_unknown_name():
+    assert Owner(name="Jordan").get_pet("Ghost") is None
+
+
+def two_pet_household() -> Owner:
+    owner = Owner(name="Jordan")
+    mochi = Pet(name="Mochi", species="dog")
+    whiskers = Pet(name="Whiskers", species="cat")
+    mochi.add_task(make_task("Morning walk", "08:00"))
+    whiskers.add_task(make_task("Feeding", "09:00"))
+    owner.add_pet(mochi)
+    owner.add_pet(whiskers)
+    return owner
+
+
+def test_scheduler_collects_tasks_across_multiple_pets():
+    scheduler = Scheduler(two_pet_household())
+    pet_names = {pet.name for pet, _task in scheduler.all_tasks()}
+    assert pet_names == {"Mochi", "Whiskers"}
+
+
+def test_sort_by_time_orders_tasks_chronologically_across_pets():
+    from datetime import time
+
+    owner = two_pet_household()
+    owner.get_pet("Mochi").add_task(make_task("Evening walk", "18:30"))
+    owner.get_pet("Whiskers").add_task(make_task("Play session", "07:15"))
+    times = [task.time for _pet, task in Scheduler(owner).sort_by_time()]
+    assert times == [time(7, 15), time(8, 0), time(9, 0), time(18, 30)]
+
+
+def test_filter_by_status_returns_only_pending_tasks():
+    owner = two_pet_household()
+    owner.get_pet("Mochi").list_tasks()[0].mark_complete()
+    pending = Scheduler(owner).filter_by_status(completed=False)
+    assert [task.description for _pet, task in pending] == ["Feeding"]
+
+
+def test_filter_by_pet_returns_only_that_pets_tasks():
+    scheduler = Scheduler(two_pet_household())
+    entries = scheduler.filter_by_pet("Whiskers")
+    assert [(pet.name, task.description) for pet, task in entries] == [
+        ("Whiskers", "Feeding")
+    ]
+
+
+def test_completing_daily_task_marks_original_completed():
+    owner = two_pet_household()
+    mochi = owner.get_pet("Mochi")
+    walk = mochi.list_tasks()[0]
+    walk.frequency = "daily"
+    Scheduler(owner).complete_task(walk)
+    assert walk.completed is True
+
+
+def test_completing_daily_task_schedules_new_task():
+    owner = two_pet_household()
+    mochi = owner.get_pet("Mochi")
+    walk = mochi.list_tasks()[0]
+    walk.frequency = "daily"
+    follow_up = Scheduler(owner).complete_task(walk)
+    assert follow_up in mochi.list_tasks()
+
+
+def test_completing_daily_task_schedules_for_tomorrow():
+    from datetime import timedelta
+
+    owner = two_pet_household()
+    mochi = owner.get_pet("Mochi")
+    walk = mochi.list_tasks()[0]
+    walk.frequency = "daily"
+    follow_up = Scheduler(owner).complete_task(walk)
+    assert follow_up.date == date.today() + timedelta(days=1)
+
+
+def test_completing_daily_task_schedules_as_incomplete():
+    owner = two_pet_household()
+    mochi = owner.get_pet("Mochi")
+    walk = mochi.list_tasks()[0]
+    walk.frequency = "daily"
+    follow_up = Scheduler(owner).complete_task(walk)
+    assert follow_up.completed is False
+
+
+def test_completing_weekly_task_schedules_it_next_week():
+    from datetime import timedelta
+
+    owner = two_pet_household()
+    whiskers = owner.get_pet("Whiskers")
+    bath = make_task("Bath", "11:00", frequency="weekly")
+    whiskers.add_task(bath)
+    follow_up = Scheduler(owner).complete_task(bath)
+    assert follow_up.date == date.today() + timedelta(days=7)
+
+
+def test_completing_one_off_task_returns_no_follow_up():
+    owner = two_pet_household()
+    whiskers = owner.get_pet("Whiskers")
+    feeding = whiskers.list_tasks()[0]
+    assert Scheduler(owner).complete_task(feeding) is None
+
+
+def test_completing_one_off_task_does_not_add_to_list():
+    owner = two_pet_household()
+    whiskers = owner.get_pet("Whiskers")
+    feeding = whiskers.list_tasks()[0]
+    Scheduler(owner).complete_task(feeding)
+    assert len(whiskers.list_tasks()) == 1
+
+
+def test_sort_by_priority_puts_high_priority_first_despite_later_time():
+    owner = two_pet_household()
+    owner.get_pet("Whiskers").add_task(make_task("Vet meds", "19:00", priority="high"))
+    entries = Scheduler(owner).sort_by_priority()
+    assert [task.description for _pet, task in entries][0] == "Vet meds"
+
+
+def test_sort_by_priority_breaks_ties_by_time():
+    from datetime import time
+
+    owner = two_pet_household()  # both existing tasks are medium priority
+    times = [task.time for _pet, task in Scheduler(owner).sort_by_priority()]
+    assert times == [time(8, 0), time(9, 0)]
+
+
+def test_next_available_slot_on_empty_day_is_day_start():
+    owner = Owner(name="Jordan")
+    owner.add_pet(Pet(name="Mochi", species="dog"))
+    assert Scheduler(owner).find_next_available_slot(30) == "07:00"
+
+
+def test_next_available_slot_skips_busy_blocks_across_pets():
+    owner = two_pet_household()
+    # Mochi busy 07:00-09:00; Whiskers busy 09:30-10:00. First 30-min gap: 09:00.
+    owner.get_pet("Mochi").list_tasks()[0].time = "07:00"
+    owner.get_pet("Mochi").list_tasks()[0].duration_minutes = 120
+    owner.get_pet("Whiskers").list_tasks()[0].time = "09:30"
+    owner.get_pet("Whiskers").list_tasks()[0].duration_minutes = 30
+    assert Scheduler(owner).find_next_available_slot(30) == "09:00"
+
+
+def test_next_available_slot_returns_none_when_nothing_fits():
+    owner = two_pet_household()
+    owner.get_pet("Mochi").add_task(
+        make_task("Day-long sitter visit", "07:00", duration_minutes=840)
+    )
+    assert Scheduler(owner).find_next_available_slot(30) is None
+
+
+def test_next_available_slot_respects_day_end_boundary_with_late_task():
+    owner = Owner(name="Jordan")
+    owner.add_pet(Pet(name="Mochi", species="dog"))
+    owner.get_pet("Mochi").add_task(
+        make_task("Day-long sitter visit", "07:00", duration_minutes=825)
+    )
+    owner.get_pet("Mochi").add_task(
+        make_task("Late medication", "22:00", duration_minutes=15)
+    )
+    assert Scheduler(owner).find_next_available_slot(30) is None
+
+
+def test_detect_conflicts_flags_same_time_tasks_across_pets():
+    owner = two_pet_household()
+    owner.get_pet("Whiskers").add_task(make_task("Medication", "08:00"))
+    warnings = Scheduler(owner).detect_conflicts()
+    assert len(warnings) == 1
+
+
+def test_detect_conflicts_warning_contains_time():
+    owner = two_pet_household()
+    owner.get_pet("Whiskers").add_task(make_task("Medication", "08:00"))
+    warnings = Scheduler(owner).detect_conflicts()
+    assert "08:00" in warnings[0]
+
+
+def test_detect_conflicts_warning_contains_first_pet_name():
+    owner = two_pet_household()
+    owner.get_pet("Whiskers").add_task(make_task("Medication", "08:00"))
+    warnings = Scheduler(owner).detect_conflicts()
+    assert "Mochi" in warnings[0]
+
+
+def test_detect_conflicts_warning_contains_second_pet_name():
+    owner = two_pet_household()
+    owner.get_pet("Whiskers").add_task(make_task("Medication", "08:00"))
+    warnings = Scheduler(owner).detect_conflicts()
+    assert "Whiskers" in warnings[0]
+
+
+def test_detect_conflicts_flags_overlapping_time_blocks():
+    owner = two_pet_household()
+    owner.get_pet("Whiskers").add_task(
+        make_task("Medication", "08:10", duration_minutes=15)
+    )
+    warnings = Scheduler(owner).detect_conflicts()
+    assert len(warnings) == 1
+
+
+def test_detect_conflicts_returns_empty_list_when_no_collisions():
+    assert Scheduler(two_pet_household()).detect_conflicts() == []
+
+
+def test_detect_conflicts_ignores_completed_tasks():
+    owner = two_pet_household()
+    owner.get_pet("Whiskers").add_task(make_task("Medication", "08:00"))
+    owner.get_pet("Mochi").list_tasks()[0].mark_complete()
+    assert Scheduler(owner).detect_conflicts() == []
+
+
+def test_tasks_for_today_excludes_future_days():
+    from datetime import timedelta
+
+    owner = two_pet_household()
+    owner.get_pet("Mochi").add_task(
+        make_task("Vet visit", "10:00", date=date.today() + timedelta(days=3))
+    )
+    descriptions = [
+        task.description for _pet, task in Scheduler(owner).tasks_for_today()
+    ]
+    assert "Vet visit" not in descriptions
+
+
+def test_tasks_for_today_includes_all_today_tasks():
+    from datetime import timedelta
+
+    owner = two_pet_household()
+    owner.get_pet("Mochi").add_task(
+        make_task("Vet visit", "10:00", date=date.today() + timedelta(days=3))
+    )
+    descriptions = [
+        task.description for _pet, task in Scheduler(owner).tasks_for_today()
+    ]
+    assert len(descriptions) == 2
+
+
+def run_persistence_round_trip(tmp_path) -> Owner:
+    from pawpal_system import Priority, load_from_json, save_to_json
+
+    owner = Owner(name="Jordan")
+    pet = Pet(name="Mochi", species="dog")
+    task1 = Task("Morning walk", "08:00", date.today(), 30, "daily")
+    task2 = Task(
+        "Vet checkup", "14:00", date.today(), 45, "once", priority=Priority.HIGH
+    )
+    pet.add_task(task1)
+    pet.add_task(task2)
+    owner.add_pet(pet)
+
+    file_path = tmp_path / "test_data.json"
+    save_to_json(owner, str(file_path))
+    return load_from_json(str(file_path))
+
+
+def test_persistence_owner_name(tmp_path):
+    loaded = run_persistence_round_trip(tmp_path)
+    assert loaded.name == "Jordan"
+
+
+def test_persistence_pets_count(tmp_path):
+    loaded = run_persistence_round_trip(tmp_path)
+    assert len(loaded.pets) == 1
+
+
+def test_persistence_pet_name(tmp_path):
+    loaded = run_persistence_round_trip(tmp_path)
+    assert loaded.pets[0].name == "Mochi"
+
+
+def test_persistence_pet_species(tmp_path):
+    loaded = run_persistence_round_trip(tmp_path)
+    assert loaded.pets[0].species == "dog"
+
+
+def test_persistence_tasks_count(tmp_path):
+    loaded = run_persistence_round_trip(tmp_path)
+    assert len(loaded.pets[0].tasks) == 2
+
+
+def test_persistence_task1_description(tmp_path):
+    loaded = run_persistence_round_trip(tmp_path)
+    assert loaded.pets[0].tasks[0].description == "Morning walk"
+
+
+def test_persistence_task1_time(tmp_path):
+    from datetime import time
+
+    loaded = run_persistence_round_trip(tmp_path)
+    assert loaded.pets[0].tasks[0].time == time(8, 0)
+
+
+def test_persistence_task2_priority(tmp_path):
+    from pawpal_system import Priority
+
+    loaded = run_persistence_round_trip(tmp_path)
+    assert loaded.pets[0].tasks[1].priority == Priority.HIGH
+
+
+def test_reschedule_task_updates_time():
+    from datetime import time
+
+    owner = two_pet_household()
+    mochi = owner.get_pet("Mochi")
+    walk = mochi.list_tasks()[0]
+    Scheduler(owner).reschedule_task(walk, time(10, 30), date.today())
+    assert walk.time == time(10, 30)
+
+
+def test_reschedule_task_updates_date():
+    from datetime import timedelta
+
+    owner = two_pet_household()
+    mochi = owner.get_pet("Mochi")
+    walk = mochi.list_tasks()[0]
+    new_date = date.today() + timedelta(days=1)
+    Scheduler(owner).reschedule_task(walk, "08:00", new_date)
+    assert walk.date == new_date
+
+
+def test_reschedule_task_raises_error_for_completed():
+    import pytest
+
+    owner = two_pet_household()
+    mochi = owner.get_pet("Mochi")
+    walk = mochi.list_tasks()[0]
+    walk.mark_complete()
+    with pytest.raises(ValueError, match="Cannot reschedule a completed task"):
+        Scheduler(owner).reschedule_task(walk, "10:30", date.today())
